@@ -196,8 +196,11 @@ class ReadPartitionDecoder {
                 } catch (IOException ex) {
                     logger.warn("[{}] Exception was thrown while decoding a message: ", traceID, ex);
                     problem = ex;
-                } catch (RuntimeException | LinkageError ex) {
-                    logger.warn("[{}] Exception was thrown while decoding a message: ", traceID, ex);
+                } catch (RuntimeException ex) {
+                    logger.warn("[{}] RuntimeException was thrown while decoding a message: ", traceID, ex);
+                    problem = new IOException("Cannot decode message", ex);
+                } catch (LinkageError ex) {
+                    logger.warn("[{}] LinkageError was thrown while decoding a message: ", traceID, ex);
                     problem = new IOException("Cannot decode message", ex);
                 }
             } finally {
