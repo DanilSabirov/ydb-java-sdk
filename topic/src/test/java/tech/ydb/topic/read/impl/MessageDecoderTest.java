@@ -77,6 +77,76 @@ public class MessageDecoderTest {
         return new BatchMeta(ReadResponse.Batch.newBuilder().setCodec(codec).build());
     }
 
+    private static Codec failingCodec(Error error, boolean failOnRead) {
+        return new Codec() {
+            @Override
+            public int getId() {
+                return 1301;
+            }
+
+            @Override
+            public InputStream decode(InputStream input) {
+                if (!failOnRead) {
+                    throw error;
+                }
+                return new InputStream() {
+                    @Override
+                    public int read() {
+                        throw error;
+                    }
+                };
+            }
+
+            @Override
+            public OutputStream encode(OutputStream output) {
+                throw new UnsupportedOperationException("Test codec is decode-only");
+            }
+        };
+    }
+
+    private static void assertLinkageErrorIsDelivered(LinkageError error, boolean failOnRead) {
+        Codec codec = failingCodec(error, failOnRead);
+        List<Codec> codecs = new ArrayList<>(StandardCodecs.getAvailableCodecs());
+        codecs.add(codec);
+        Queue<Runnable> decodeTasks = new ConcurrentLinkedQueue<>();
+        MessageDecoder decoder = new MessageDecoder(40, decodeTasks::add, new CodecRegistry(codecs));
+        AtomicInteger ready = new AtomicInteger();
+        ReadPartitionDecoder partition = new ReadPartitionDecoder("p1", decoder, PS1, null, ready::incrementAndGet);
+        byte[] raw = new byte[] {1, 2};
+        MessageImpl failed = partition.decode(meta(codec.getId()), OffsetsRange.of(1), rawMsg(1, 40, raw));
+        MessageImpl next = partition.decode(meta(Codec.GZIP), OffsetsRange.of(2), gzipMsg(2, 40));
+
+        decoder.decodeNext();
+        Assert.assertEquals(1, decodeTasks.size());
+        Assert.assertEquals(0, decoder.getTotalAvailable());
+        Assert.assertFalse(failed.isReady());
+        Assert.assertFalse(next.isReady());
+
+        // Run after execute() returns, so its scheduling-error handler cannot catch the codec failure.
+        decodeTasks.poll().run();
+        Assert.assertTrue(failed.isReady());
+        Assert.assertEquals(1, ready.get());
+        DecompressionException ex = Assert.assertThrows(DecompressionException.class, failed::getData);
+        Assert.assertSame(error, ex.getCause().getCause());
+        Assert.assertArrayEquals(raw, ex.getRawData());
+        Assert.assertEquals(codec.getId(), ex.getCodec());
+        Assert.assertEquals(0, decoder.getTotalAvailable());
+        Assert.assertTrue(decodeTasks.isEmpty());
+        Assert.assertFalse(next.isReady());
+
+        partition.releaseRange(OffsetsRange.of(1));
+        Assert.assertEquals(1, decodeTasks.size());
+        decodeTasks.poll().run();
+        Assert.assertTrue(next.isReady());
+        Assert.assertEquals(2, ready.get());
+        byte[] expected = new byte[40];
+        Arrays.fill(expected, (byte) 2);
+        Assert.assertArrayEquals(expected, next.getData());
+        partition.releaseRange(OffsetsRange.of(2));
+        Assert.assertEquals(40, decoder.getTotalAvailable());
+        Assert.assertTrue(decodeTasks.isEmpty());
+    }
+
     @Rule
     public final HideLoggersRule hideLogger = new HideLoggersRule();
 
@@ -548,5 +618,41 @@ public class MessageDecoderTest {
         Assert.assertEquals(200, decoder.getTotalAvailable());
         p1.close();
         Assert.assertEquals(200, decoder.getTotalAvailable());
+    }
+
+    @Test
+    @HideLoggers(ReadPartition.class)
+    public void linkageErrorsFromCodecTest() {
+        assertLinkageErrorIsDelivered(new ExceptionInInitializerError("Cannot initialize native codec"), false);
+        assertLinkageErrorIsDelivered(new NoClassDefFoundError("Previously failed native codec"), false);
+        assertLinkageErrorIsDelivered(new UnsatisfiedLinkError("Cannot load native codec"), false);
+    }
+
+    @Test
+    @HideLoggers(ReadPartition.class)
+    public void linkageErrorsFromDecodedStreamTest() {
+        assertLinkageErrorIsDelivered(new ExceptionInInitializerError("Cannot initialize native codec"), true);
+        assertLinkageErrorIsDelivered(new NoClassDefFoundError("Previously failed native codec"), true);
+        assertLinkageErrorIsDelivered(new UnsatisfiedLinkError("Cannot call native codec"), true);
+    }
+
+    @Test
+    public void fatalDecodeErrorsAreNotConvertedTest() {
+        for (Error error : Arrays.asList(new OutOfMemoryError("Synthetic failure"), new ThreadDeath())) {
+            for (boolean failOnRead : new boolean[] {false, true}) {
+                Codec codec = failingCodec(error, failOnRead);
+                Queue<Runnable> decodeTasks = new ConcurrentLinkedQueue<>();
+                MessageDecoder decoder = new MessageDecoder(40, decodeTasks::add,
+                        new CodecRegistry(Arrays.asList(codec)));
+                ReadPartitionDecoder partition = new ReadPartitionDecoder("p1", decoder, PS1, null, () -> { });
+                partition.decode(meta(codec.getId()), OffsetsRange.of(1), rawMsg(1, 40, new byte[] {1, 2}));
+
+                decoder.decodeNext();
+                Assert.assertEquals(1, decodeTasks.size());
+                Assert.assertSame(error, Assert.assertThrows(error.getClass(), () -> decodeTasks.poll().run()));
+                partition.close();
+                Assert.assertEquals(40, decoder.getTotalAvailable());
+            }
+        }
     }
 }
